@@ -1,0 +1,47 @@
+services:
+  valkey:
+    image: 'valkey/valkey:latest'
+    ports:
+      - '${VALKEY_PORT:-6379}:6379'
+    volumes:
+      - ./valkey-data:/data
+      - ./valkeyconf:/etc/valkey
+    command: valkey-server /etc/valkey/valkey.conf --requirepass ${VALKEY_PASSWORD}
+    networks:
+      - frame-analysis-network
+    env_file: .env
+    environment:
+      - TZ=UTC
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # RabbitMQ for message queuing
+  rabbitmq:
+    image: 'rabbitmq:3-management'
+    ports:
+      - '${RABBITMQ_PORT:-5672}:5672'  # AMQP port
+      - '${RABBITMQ_MGMT_PORT:-15672}:15672'  # Management UI
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS}
+    volumes:
+      - ./rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - frame-analysis-network
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  frame-analysis-network:
+    driver: bridge
+
+volumes:
+  valkey-data:
+  rabbitmq-data:
