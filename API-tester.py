@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Default values
 DEFAULT_GATEWAY_URL = "http://192.168.1.102:8001"
-DEFAULT_STREAM_URL = "https://content.jwplatform.com/manifests/vM7nH0Kl.m3u8?ref=developerinsider.co"
+DEFAULT_STREAM_URL = "https://content.jwplatform.com/manifests/vM7nH0Kl.m3u8?abcde"
 DEFAULT_TEST_COUNT = 40
 DEFAULT_DELAY = 0.5  # seconds between tests, to stay within 10s window
 

@@ -38,6 +38,18 @@ services:
       timeout: 5s
       retries: 5
 
+  api-gateway:
+    image: 'api-gateway:0.0.1'
+    ports:
+      - "8001:8001"
+    env_file: .env
+    restart: unless-stopped
+    networks:
+      - frame-analysis-network
+    depends_on:
+      - valkey
+      - rabbitmq
+
 networks:
   frame-analysis-network:
     driver: bridge

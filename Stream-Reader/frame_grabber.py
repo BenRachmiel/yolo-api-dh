@@ -2,11 +2,9 @@ import os
 import time
 import logging
 import threading
-import io
 import cv2
-import numpy as np
 import tempfile
-from typing import Dict, Optional
+from typing import Dict
 from dotenv import load_dotenv
 
 import ffmpeg

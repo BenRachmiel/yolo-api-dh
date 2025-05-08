@@ -4,13 +4,13 @@ import logging
 import time
 import uuid
 import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional, Any
 from dotenv import load_dotenv
 
 import aio_pika
 import redis
 import httpx
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # Load environment variables from .env file
@@ -59,12 +59,7 @@ GATEWAY_ID = os.environ.get("GATEWAY_ID", f"gateway-{uuid.uuid4()}")
 MAX_PRIORITY = 5
 
 # Clients
-valkey_client = redis.Redis(
-    host=VALKEY_HOST,
-    port=VALKEY_PORT,
-    password=VALKEY_PASSWORD,
-    decode_responses=True
-)
+valkey_client = None
 
 # RabbitMQ connection
 rabbitmq_connection = None
@@ -128,58 +123,133 @@ async def get_queue_info(queue_name: str) -> Dict[str, Any]:
 
 
 async def init_rabbitmq():
-    """Initialize RabbitMQ connection and channel"""
+    """Initialize RabbitMQ connection and channel with retries"""
     global rabbitmq_connection, rabbitmq_channel, status_queue
 
-    try:
-        # Connect to RabbitMQ
-        rabbitmq_connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    # Retry configuration
+    max_retries = 30  # Maximum number of retry attempts
+    retry_delay = 5  # Seconds between retries
+    attempt = 0
 
-        # Create channel
-        rabbitmq_channel = await rabbitmq_connection.channel()
+    while attempt < max_retries:
+        try:
+            logger.info(
+                f"Attempting to connect to RabbitMQ at {RABBITMQ_HOST}:{RABBITMQ_PORT} (attempt {attempt + 1}/{max_retries})")
 
-        # Declare exchanges
-        analysis_exchange = await rabbitmq_channel.declare_exchange(
-            "analysis_exchange",
-            aio_pika.ExchangeType.DIRECT
-        )
+            # Connect to RabbitMQ
+            rabbitmq_connection = await aio_pika.connect_robust(
+                RABBITMQ_URL,
+                timeout=10  # Connection timeout in seconds
+            )
 
-        status_exchange = await rabbitmq_channel.declare_exchange(
-            "status_exchange",
-            aio_pika.ExchangeType.TOPIC
-        )
+            # Create channel
+            rabbitmq_channel = await rabbitmq_connection.channel()
 
-        # Declare analysis queue with priority support
-        analysis_queue = await rabbitmq_channel.declare_queue(
-            "analysis_queue",
-            durable=True,
-            arguments={"x-max-priority": MAX_PRIORITY}
-        )
+            # Declare exchanges
+            analysis_exchange = await rabbitmq_channel.declare_exchange(
+                "analysis_exchange",
+                aio_pika.ExchangeType.DIRECT
+            )
 
-        # Bind analysis queue to exchange
-        await analysis_queue.bind(analysis_exchange)
+            status_exchange = await rabbitmq_channel.declare_exchange(
+                "status_exchange",
+                aio_pika.ExchangeType.TOPIC
+            )
 
-        # Create and bind status queue for this gateway instance
-        status_queue = await rabbitmq_channel.declare_queue(
-            f"status_queue.{GATEWAY_ID}",
-            auto_delete=True
-        )
+            # Declare analysis queue with priority support
+            analysis_queue = await rabbitmq_channel.declare_queue(
+                "analysis_queue",
+                durable=True,
+                arguments={"x-max-priority": MAX_PRIORITY}
+            )
 
-        await status_queue.bind(
-            status_exchange,
-            routing_key="status.#"
-        )
+            # Bind analysis queue to exchange
+            await analysis_queue.bind(analysis_exchange)
 
-        # Start consuming status messages
-        await status_queue.consume(process_status_update)
+            # Create and bind status queue for this gateway instance
+            status_queue = await rabbitmq_channel.declare_queue(
+                f"status_queue.{GATEWAY_ID}",
+                auto_delete=True
+            )
 
-        logger.info(f"Connected to RabbitMQ as gateway {GATEWAY_ID}")
-        return True
+            await status_queue.bind(
+                status_exchange,
+                routing_key="status.#"
+            )
 
-    except Exception as e:
-        logger.error(f"Failed to initialize RabbitMQ: {str(e)}")
-        return False
+            # Start consuming status messages
+            await status_queue.consume(process_status_update)
 
+            logger.info(f"Successfully connected to RabbitMQ as gateway {GATEWAY_ID}")
+            return True
+
+        except (ConnectionError, aio_pika.exceptions.AMQPConnectionError) as e:
+            attempt += 1
+            if attempt >= max_retries:
+                logger.error(f"Failed to connect to RabbitMQ after {max_retries} attempts: {str(e)}")
+                return False
+
+            logger.warning(f"RabbitMQ connection failed (attempt {attempt}/{max_retries}): {str(e)}")
+            logger.info(f"Retrying in {retry_delay} seconds...")
+            await asyncio.sleep(retry_delay)
+
+        except Exception as e:
+            logger.error(f"Unexpected error initializing RabbitMQ: {str(e)}")
+            return False
+
+    logger.error(f"Unexpected error initializing RabbitMQ but no exception thrown.")
+    return False
+
+
+def init_valkey():
+    """Initialize ValKey (Redis) connection with retries"""
+    global valkey_client
+
+    # Retry configuration
+    max_retries = 30  # Maximum number of retry attempts
+    retry_delay = 5  # Seconds between retries
+    attempt = 0
+
+    while attempt < max_retries:
+        try:
+            logger.info(
+                f"Attempting to connect to ValKey at {VALKEY_HOST}:{VALKEY_PORT} (attempt {attempt + 1}/{max_retries})")
+
+            # Create Redis client
+            temp_client = redis.Redis(
+                host=VALKEY_HOST,
+                port=VALKEY_PORT,
+                password=VALKEY_PASSWORD,
+                decode_responses=True,
+                socket_connect_timeout=5,  # Connection timeout in seconds
+                socket_timeout=5,  # Socket timeout in seconds
+                retry_on_timeout=True  # Retry on timeout
+            )
+
+            # Test connection with ping
+            if temp_client.ping():
+                valkey_client = temp_client
+                logger.info(f"Successfully connected to ValKey")
+                return True
+            else:
+                raise ConnectionError("ValKey ping failed")
+
+        except (ConnectionError, redis.exceptions.ConnectionError) as e:
+            attempt += 1
+            if attempt >= max_retries:
+                logger.error(f"Failed to connect to ValKey after {max_retries} attempts: {str(e)}")
+                return False
+
+            logger.warning(f"ValKey connection failed (attempt {attempt}/{max_retries}): {str(e)}")
+            logger.info(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+
+        except Exception as e:
+            logger.error(f"Unexpected error initializing ValKey: {str(e)}")
+            return False
+
+    logger.error(f"Unexpected error initializing ValKey but no exception thrown.")
+    return False
 
 async def process_status_update(message):
     """Process status updates from workers"""
@@ -247,6 +317,52 @@ async def process_status_update(message):
             logger.error(f"Error processing status update: {str(e)}")
 
 
+def is_worker_alive(worker_id: str) -> bool:
+    """
+    Check if a worker is alive based on its heartbeat entry in ValKey.
+
+    Args:
+        worker_id: The ID of the worker to check
+
+    Returns:
+        bool: True if the worker is alive, False otherwise
+    """
+    try:
+        # Worker keys are automatically expired after 60 seconds if not updated
+        # so if the key exists, the worker is considered alive
+        return valkey_client.exists(f"worker:{worker_id}") > 0
+    except Exception as e:
+        logger.error(f"Error checking worker status: {str(e)}")
+        # If we can't check, assume worker is dead to avoid routing to it
+        return False
+
+
+def check_and_clean_worker_preference(stream_url: str, preferred_worker_id: str) -> Optional[str]:
+    """
+    Check if the preferred worker is alive and return it, or clean up if dead.
+
+    Args:
+        stream_url: URL of the stream
+        preferred_worker_id: ID of the preferred worker
+
+    Returns:
+        Optional[str]: The worker_id if alive, None if dead or error
+    """
+    if not preferred_worker_id:
+        return None
+
+    try:
+        if is_worker_alive(preferred_worker_id):
+            return preferred_worker_id
+        else:
+            # Worker is dead, clean up the stream location entry
+            logger.warning(f"Preferred worker {preferred_worker_id} for stream {stream_url} is dead. Cleaning up.")
+            valkey_client.delete(get_stream_location_key(stream_url))
+            return None
+    except Exception as e:
+        logger.error(f"Error checking/cleaning worker preference: {str(e)}")
+        return None
+
 # API Endpoints
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_frame(request: AnalysisRequest):
@@ -282,7 +398,8 @@ async def analyze_frame(request: AnalysisRequest):
         "url": url,
         "status": "queued",
         "created_at": str(time.time()),
-        "callback_url": str(request.callback_url) if request.callback_url else ""
+        "callback_url": str(request.callback_url) if request.callback_url else "",
+        "attempt_count": "0"  # Add an attempt counter to track retries
     }
 
     valkey_client.hset(get_request_key(request_id), mapping=request_data)
@@ -296,14 +413,21 @@ async def analyze_frame(request: AnalysisRequest):
         "request_id": request_id,
         "stream_url": url,
         "created_at": time.time(),
-        "force_refresh": request.force_refresh
+        "force_refresh": request.force_refresh,
+        "attempt_count": 0  # Also track attempts in the message
     }
 
     # Check if we know which worker has this stream open
     worker_id = valkey_client.get(get_stream_location_key(url))
     if worker_id:
-        message_data["preferred_worker"] = worker_id
-        logger.info(f"Routing request {request_id} to worker {worker_id}")
+        # Verify the worker is actually alive before assigning preference
+        if is_worker_alive(worker_id):
+            message_data["preferred_worker"] = worker_id
+            logger.info(f"Routing request {request_id} to worker {worker_id}")
+        else:
+            # Worker is dead, clean up its stream location
+            logger.warning(f"Worker {worker_id} for stream {url} is dead. Removing stream location.")
+            valkey_client.delete(get_stream_location_key(url))
 
     # Publish to RabbitMQ
     try:
@@ -315,7 +439,8 @@ async def analyze_frame(request: AnalysisRequest):
             aio_pika.Message(
                 body=json.dumps(message_data).encode(),
                 priority=request.priority,
-                delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                expiration=300000  # 5 minutes TTL in milliseconds for the message
             ),
             routing_key="analysis"
         )
@@ -451,11 +576,129 @@ async def health_check():
     }
 
 
+@app.delete("/streams/worker/{worker_id}")
+async def clear_worker_streams(worker_id: str):
+    """Clear all stream assignments for a specific worker (for manual recovery)"""
+    try:
+        # Get all stream location keys
+        stream_location_keys = valkey_client.keys("stream_location:*")
+        cleared_streams = []
+
+        for key in stream_location_keys:
+            stream_url = key.replace("stream_location:", "")
+            assigned_worker = valkey_client.get(key)
+
+            if assigned_worker == worker_id:
+                logger.info(f"Clearing stream {stream_url} assignment from worker {worker_id}")
+                valkey_client.delete(key)
+                cleared_streams.append(stream_url)
+
+        # Try to delete the worker record too
+        valkey_client.delete(f"worker:{worker_id}")
+
+        return {
+            "status": "ok",
+            "message": f"Cleared {len(cleared_streams)} streams assigned to worker {worker_id}",
+            "cleared_streams": cleared_streams
+        }
+
+    except Exception as e:
+        logger.error(f"Error clearing worker streams: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear worker streams: {str(e)}")
+
+@app.post("/streams/reassign")
+async def reassign_stream(stream_url: str, new_worker_id: Optional[str] = None):
+    """
+    Manually reassign a stream to a different worker or clear its assignment.
+    If new_worker_id is None, just clears the current assignment.
+    """
+    try:
+        # Check if the stream exists
+        stream_key = get_stream_location_key(stream_url)
+        current_worker = valkey_client.get(stream_key)
+
+        if not current_worker:
+            return {
+                "status": "ok",
+                "message": f"Stream {stream_url} was not assigned to any worker"
+            }
+
+        # Clear the current assignment
+        valkey_client.delete(stream_key)
+
+        # Assign to new worker if specified
+        if new_worker_id:
+            # Check if the worker exists
+            if is_worker_alive(new_worker_id):
+                valkey_client.set(stream_key, new_worker_id, ex=STREAM_INFO_TTL)
+                return {
+                    "status": "ok",
+                    "message": f"Reassigned stream {stream_url} from {current_worker} to {new_worker_id}"
+                }
+            else:
+                return {
+                    "status": "warning",
+                    "message": f"Cleared assignment for {stream_url}, but new worker {new_worker_id} is not active"
+                }
+        else:
+            return {
+                "status": "ok",
+                "message": f"Cleared stream {stream_url} assignment from worker {current_worker}"
+            }
+
+    except Exception as e:
+        logger.error(f"Error reassigning stream: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to reassign stream: {str(e)}")
+
+async def cleanup_dead_worker_streams():
+    """
+    Periodically scan for dead workers and clean up their stream assignments.
+    This prevents requests from being permanently routed to dead workers.
+    """
+    while True:
+        try:
+            # Get all worker keys
+            worker_keys = valkey_client.keys("worker:*")
+            active_workers = set()
+
+            for key in worker_keys:
+                worker_id = key.replace("worker:", "")
+                active_workers.add(worker_id)
+
+            # Get all stream location keys
+            stream_location_keys = valkey_client.keys("stream_location:*")
+
+            for key in stream_location_keys:
+                stream_url = key.replace("stream_location:", "")
+                worker_id = valkey_client.get(key)
+
+                if worker_id and worker_id not in active_workers:
+                    logger.warning(f"Found stream {stream_url} assigned to dead worker {worker_id}. Cleaning up.")
+                    valkey_client.delete(key)
+
+            logger.info(f"Dead worker cleanup complete. Found {len(active_workers)} active workers.")
+
+        except Exception as e:
+            logger.error(f"Error during dead worker cleanup: {str(e)}")
+
+        # Run every 2 minutes
+        await asyncio.sleep(120)
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize connections on startup"""
-    await init_rabbitmq()
+    # Initialize ValKey
+    if not init_valkey():
+        logger.error("Failed to initialize ValKey. API Gateway will have limited functionality.")
 
+    # Initialize RabbitMQ
+    if not await init_rabbitmq():
+        logger.error("Failed to initialize RabbitMQ. API Gateway will have limited functionality.")
+
+    # Start the dead worker cleanup task
+    asyncio.create_task(cleanup_dead_worker_streams())
+
+    logger.info("API Gateway startup complete.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
