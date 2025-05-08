@@ -54,7 +54,7 @@ RABBITMQ_URL = f"amqp://{RABBITMQ_USER}:{RABBITMQ_PASS}@{RABBITMQ_HOST}:{RABBITM
 
 RESULTS_TTL = int(os.environ.get("RESULTS_TTL", 10))  # 10 seconds for results cache
 STREAM_INFO_TTL = int(os.environ.get("STREAM_INFO_TTL", 300))  # 5 minutes for stream locations
-REQUEST_TTL = int(os.environ.get("REQUEST_TTL", 3600))  # 1 hour for request data
+REQUEST_TTL = int(os.environ.get("REQUEST_TTL", 30))  # 30 seconds for request data
 GATEWAY_ID = os.environ.get("GATEWAY_ID", f"gateway-{uuid.uuid4()}")
 MAX_PRIORITY = 5
 
