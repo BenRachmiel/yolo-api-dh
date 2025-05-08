@@ -1,14 +1,13 @@
 services:
   valkey:
     image: 'valkey/valkey:latest'
-    ports:
-      - '${VALKEY_PORT:-6379}:6379'
+    # No external ports exposed
     volumes:
       - ./valkey-data:/data
       - ./valkeyconf:/etc/valkey
     command: valkey-server /etc/valkey/valkey.conf --requirepass ${VALKEY_PASSWORD}
     networks:
-      - frame-analysis-network
+      - frame-analysis-internal
     env_file: .env
     environment:
       - TZ=UTC
@@ -21,16 +20,17 @@ services:
   # RabbitMQ for message queuing
   rabbitmq:
     image: 'rabbitmq:3-management'
-    ports:
-      - '${RABBITMQ_PORT:-5672}:5672'  # AMQP port
-      - '${RABBITMQ_MGMT_PORT:-15672}:15672'  # Management UI
+    # Management UI only accessible internally
+    expose:
+      - "5672"  # AMQP port (internal only)
+      - "15672"  # Management UI (internal only)
     environment:
       - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER}
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS}
     volumes:
       - ./rabbitmq-data:/var/lib/rabbitmq
     networks:
-      - frame-analysis-network
+      - frame-analysis-internal
     env_file: .env
     healthcheck:
       test: ["CMD", "rabbitmqctl", "status"]
@@ -38,8 +38,69 @@ services:
       timeout: 5s
       retries: 5
 
+  api-gateway:
+    image: 'api-gateway:0.0.1'
+    # Only API Gateway is exposed externally on port 10800
+    ports:
+      - "10800:8001"
+    env_file: .env
+    restart: unless-stopped
+    networks:
+      - frame-analysis-internal
+    depends_on:
+      - valkey
+      - rabbitmq
+    # Update the environment variables to use internal hostnames
+    environment:
+      - VALKEY_HOST=valkey
+      - VALKEY_PORT=6379
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+
+  frame-analyzer:
+    image: 'frame-analyzer:0.0.2'
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["python3.11 /opt/app-root/src/frame_grabber_analyzer.py"]
+    user: default
+    expose:
+      - "8000"
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./models:/opt/app-root/src/models
+    networks:
+      - frame-analysis-internal
+    depends_on:
+      - valkey
+      - rabbitmq
+    # NVIDIA GPU configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Alternative method for older Docker Compose versions
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      # Internal service hostnames
+      - VALKEY_HOST=valkey
+      - VALKEY_PORT=6379
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=5672
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+
 networks:
-  frame-analysis-network:
+  frame-analysis-internal:
     driver: bridge
 
 volumes:

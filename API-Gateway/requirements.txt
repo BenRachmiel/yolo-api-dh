@@ -1,0 +1,8 @@
+aio-pika
+redis
+httpx
+uvicorn
+dotenv
+python-dotenv
+fastapi
+pydantic

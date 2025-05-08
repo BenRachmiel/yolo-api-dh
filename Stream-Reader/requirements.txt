@@ -1,0 +1,10 @@
+pillow
+ultralytics
+aio-pika
+redis
+psutil
+fastapi
+uvicorn
+opencv-python
+ffmpeg-python
+python-dotenv

@@ -5,7 +5,6 @@ import time
 import uuid
 import json
 import threading
-from typing import Dict, Optional, List, Any
 import io
 from dotenv import load_dotenv
 
@@ -13,9 +12,8 @@ import aio_pika
 import redis
 import psutil
 from PIL import Image
-import numpy as np
 from ultralytics import YOLO
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 import uvicorn
 
 # Load environment variables from .env file
@@ -58,7 +56,7 @@ MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", 5))
 start_time = time.time()
 
 # Load YOLO model
-YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolo12n.pt")
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "models/yolo12n.pt")
 logger.info(f"Loading YOLO model: {YOLO_MODEL}")
 
 try:
@@ -244,6 +242,10 @@ async def process_analysis_request(message):
                 request_data = json.loads(message.body.decode())
                 request_id = request_data.get("request_id")
                 stream_url = request_data.get("stream_url")
+                attempt_count = request_data.get("attempt_count", 0)
+
+                # Track attempts to prevent infinite loops
+                request_data["attempt_count"] = attempt_count + 1
 
                 if not request_id or not stream_url:
                     logger.error("Invalid request data")
@@ -252,11 +254,51 @@ async def process_analysis_request(message):
                 # Check if this request is specifically routed to this worker
                 preferred_worker = request_data.get("preferred_worker")
                 if preferred_worker and preferred_worker != WORKER_ID:
-                    logger.info(
-                        f"Request {request_id} is preferred for worker {preferred_worker}, this worker is {WORKER_ID}")
-                    # Requeue the message - this is optional, as another worker should pick it up
-                    await message.nack(requeue=True)
-                    return
+                    # Check if we should still honor the preference
+                    # - Don't requeue if we've tried too many times (prevents infinite loops)
+                    # - Don't requeue if we've been waiting too long (> 60 seconds)
+                    max_attempts = 5  # Maximum number of routing attempts
+                    created_at = request_data.get("created_at", 0)
+                    time_since_creation = time.time() - created_at
+
+                    if attempt_count >= max_attempts:
+                        logger.warning(
+                            f"Request {request_id} exceeded max routing attempts ({attempt_count}/{max_attempts}). "
+                            f"Processing on this worker instead of preferred worker {preferred_worker}."
+                        )
+                    elif time_since_creation > 60:  # 60 seconds timeout
+                        logger.warning(
+                            f"Request {request_id} exceeded routing timeout ({time_since_creation:.1f}s > 60s). "
+                            f"Processing on this worker instead of preferred worker {preferred_worker}."
+                        )
+                    else:
+                        # Check if the preferred worker is still alive via redis
+                        try:
+                            worker_alive = valkey_client.exists(f"worker:{preferred_worker}") > 0
+                            if worker_alive:
+                                logger.info(
+                                    f"Request {request_id} is preferred for worker {preferred_worker}, "
+                                    f"this worker is {WORKER_ID}. Requeuing (attempt {attempt_count}/{max_attempts})."
+                                )
+                                # Requeue the message with updated attempt count
+                                await rabbitmq_channel.get_exchange("analysis_exchange").publish(
+                                    aio_pika.Message(
+                                        body=json.dumps(request_data).encode(),
+                                        priority=message.priority if hasattr(message, 'priority') else 0,
+                                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                                        expiration=300000  # 5 minutes TTL in milliseconds
+                                    ),
+                                    routing_key="analysis"
+                                )
+                                return
+                            else:
+                                logger.warning(
+                                    f"Preferred worker {preferred_worker} appears to be dead. "
+                                    f"Processing on this worker {WORKER_ID} instead."
+                                )
+                        except Exception as e:
+                            logger.error(f"Error checking worker status: {str(e)}")
+                            # If we can't check, assume we should process it
 
                 logger.info(f"Processing request {request_id} for stream {stream_url}")
 
@@ -426,9 +468,8 @@ async def main():
     if not await init_rabbitmq():
         logger.error("Failed to initialize RabbitMQ, retrying in 5 seconds...")
         await asyncio.sleep(5)
-        if not await init_rabbitmq():
-            logger.error("Failed to initialize RabbitMQ again, exiting...")
-            return
+        while not await init_rabbitmq():
+            logger.error("Failed to initialize RabbitMQ again, retrying in 5 seconds...")
 
     # Start health monitoring
     asyncio.create_task(worker_heartbeat())
