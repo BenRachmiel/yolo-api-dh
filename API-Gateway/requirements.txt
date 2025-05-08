@@ -1,8 +1,8 @@
-aio-pika~=9.5.5
-redis~=6.0.0
-httpx~=0.28.1
-uvicorn~=0.34.2
-dotenv~=0.9.9
-python-dotenv~=1.1.0
-fastapi~=0.115.12
-pydantic~=2.11.4
+aio-pika
+redis
+httpx
+uvicorn
+dotenv
+python-dotenv
+fastapi
+pydantic

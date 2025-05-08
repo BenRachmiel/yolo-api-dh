@@ -56,7 +56,7 @@ MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", 5))
 start_time = time.time()
 
 # Load YOLO model
-YOLO_MODEL = os.environ.get("YOLO_MODEL", "../yolo12n.pt")
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "models/yolo12n.pt")
 logger.info(f"Loading YOLO model: {YOLO_MODEL}")
 
 try:
@@ -468,9 +468,8 @@ async def main():
     if not await init_rabbitmq():
         logger.error("Failed to initialize RabbitMQ, retrying in 5 seconds...")
         await asyncio.sleep(5)
-        if not await init_rabbitmq():
-            logger.error("Failed to initialize RabbitMQ again, exiting...")
-            return
+        while not await init_rabbitmq():
+            logger.error("Failed to initialize RabbitMQ again, retrying in 5 seconds...")
 
     # Start health monitoring
     asyncio.create_task(worker_heartbeat())
