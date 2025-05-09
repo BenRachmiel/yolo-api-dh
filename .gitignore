@@ -1,2 +1,9 @@
 /test.mp4
 /uv.lock
+API-Gateway/.env
+models/*
+Stream-Reader/.env
+.env
+.idea
+*-data
+*/__pycache__
