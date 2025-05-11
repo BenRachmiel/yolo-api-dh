@@ -1,4 +1,4 @@
-/test.mp4
+*.mp4
 /uv.lock
 API-Gateway/.env
 models/*

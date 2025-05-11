@@ -2,6 +2,8 @@ services:
   valkey:
     image: 'valkey/valkey:latest'
     # No external ports exposed
+    ports:
+      - "6379:6379"
     volumes:
       - ./valkey-data:/data
       - ./valkeyconf:/etc/valkey
@@ -21,6 +23,8 @@ services:
   rabbitmq:
     image: 'rabbitmq:3-management'
     # Management UI only accessible internally
+    ports:
+      - "5672:5672"
     expose:
       - "5672"  # AMQP port (internal only)
       - "15672"  # Management UI (internal only)
@@ -58,7 +62,7 @@ services:
       - RABBITMQ_PORT=5672
 
   frame-analyzer:
-    image: 'frame-analyzer:0.0.2'
+    image: 'frame-analyzer:latest'
     entrypoint: ["/bin/bash", "-c"]
     command: ["python3.11 /opt/app-root/src/frame_grabber_analyzer.py"]
     user: default

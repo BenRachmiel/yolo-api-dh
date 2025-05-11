@@ -12,6 +12,7 @@ import aio_pika
 import redis
 import psutil
 from PIL import Image
+import torch
 from ultralytics import YOLO
 from fastapi import HTTPException
 import uvicorn
@@ -55,26 +56,32 @@ MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", 5))
 # Initialize start time
 start_time = time.time()
 
-# Load YOLO model
-YOLO_MODEL = os.environ.get("YOLO_MODEL", "models/yolo12n.pt")
-logger.info(f"Loading YOLO model: {YOLO_MODEL}")
+# YOLO model and device are global variables
+model = None
+device = None
 
-try:
-    model = YOLO(YOLO_MODEL)
-    logger.info(f"YOLO model loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load YOLO model: {str(e)}")
-    model = None
+
+def load_model():
+    """Load the YOLO model - separate function for multiprocessing compatibility"""
+    global model, device
+
+    YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolo11n.pt")
+    logger.info(f"Loading YOLO model: {YOLO_MODEL}")
+
+    try:
+        # Important: initialize CUDA context in the subprocess
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model = YOLO(YOLO_MODEL)
+        model.to(device)
+        logger.info(f"Device: {device}")
+        logger.info(f"YOLO model loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load YOLO model: {str(e)}")
+        model = None
+
 
 # Clients
-valkey_client = redis.Redis(
-    host=VALKEY_HOST,
-    port=VALKEY_PORT,
-    password=VALKEY_PASSWORD,
-    decode_responses=True
-)
-
-# RabbitMQ connection
+valkey_client = None
 rabbitmq_connection = None
 rabbitmq_channel = None
 
@@ -110,7 +117,8 @@ async def analyze_frame(url: str):
                 "timestamp": time.time()
             }
 
-        results = model.predict(image, imgsz=(1280,736))
+        logger.info(f"{image.size = }")
+        results = model.predict(image, imgsz=(736,1280), device=device)
 
         # Process results
         detections = []
@@ -145,7 +153,7 @@ async def health_check():
     # Check ValKey
     valkey_healthy = False
     try:
-        if valkey_client.ping():
+        if valkey_client and valkey_client.ping():
             valkey_healthy = True
     except Exception as e:
         logger.error(f"ValKey health check failed: {str(e)}")
@@ -159,8 +167,9 @@ async def health_check():
         "uptime": time.time() - start_time,
         "active_tasks": active_tasks,
         "active_streams": len(streams),
-        "yolo_model": YOLO_MODEL,
+        "yolo_model": os.environ.get("YOLO_MODEL", "models/yolo12n.pt"),
         "model_loaded": model is not None,
+        "device": str(device),
         "valkey": "connected" if valkey_healthy else "disconnected",
         "rabbitmq": "connected" if rabbitmq_healthy else "disconnected"
     }
@@ -331,7 +340,8 @@ async def process_analysis_request(message):
                         )
                         return
 
-                    results = model(image)
+                    logger.info(f"{image.size = }")
+                    results = model.predict(image, imgsz=(736,1280), device=device)
 
                     # Process results
                     detections = []
@@ -420,6 +430,20 @@ async def publish_status_update(request_id, status, result=None, error=None, str
 
 async def register_worker():
     """Register this worker in ValKey"""
+    global valkey_client
+
+    if not valkey_client:
+        try:
+            valkey_client = redis.Redis(
+                host=VALKEY_HOST,
+                port=VALKEY_PORT,
+                password=VALKEY_PASSWORD,
+                decode_responses=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to connect to ValKey: {str(e)}")
+            return
+
     try:
         # Get worker stats
         with streams_lock:
@@ -437,7 +461,7 @@ async def register_worker():
             "cpu_usage": psutil.cpu_percent(),
             "memory_usage": psutil.Process().memory_info().rss / (1024 * 1024),  # MB
             "tasks": active_tasks,
-            "model": YOLO_MODEL
+            "model": os.environ.get("YOLO_MODEL", "models/yolo12n.pt")
         }
 
         valkey_client.hset(f"worker:{WORKER_ID}", mapping=worker_info)
@@ -494,15 +518,17 @@ async def main():
         logger.info("Worker shut down")
 
 
-if __name__ == "__main__":
-    import multiprocessing
+def run_worker():
+    """Function to run in a separate process"""
+    # Initialize model in this process
+    load_model()
 
-    # Start the worker process
-    worker_process = multiprocessing.Process(
-        target=asyncio.run,
-        args=(main(),)
-    )
-    worker_process.start()
+    # Run the async main function
+    asyncio.run(main())
+
+
+def run_api():
+    """Function to run FastAPI in a separate process"""
 
     # Start the FastAPI app
     uvicorn.run(
@@ -511,3 +537,26 @@ if __name__ == "__main__":
         port=8000,
         log_level="info"
     )
+
+
+if __name__ == "__main__":
+    import multiprocessing
+
+    # Make sure to use 'spawn' method for CUDA compatibility
+    multiprocessing.set_start_method('spawn')
+
+    # Start the worker process
+    worker_process = multiprocessing.Process(
+        target=run_worker
+    )
+    worker_process.start()
+
+    # Either run API in main process or as another process
+    api_process = multiprocessing.Process(
+        target=run_api
+    )
+    api_process.start()
+
+    # Wait for processes to finish
+    worker_process.join()
+    api_process.join()
