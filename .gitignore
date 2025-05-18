@@ -7,3 +7,4 @@ Stream-Reader/.env
 .idea
 *-data
 */__pycache__
+Stream-Reader/models
